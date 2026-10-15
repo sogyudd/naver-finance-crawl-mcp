@@ -490,4 +490,307 @@ export async function getShareholders(code: string) {
   return holders;
 }
 
+// ---------------------------------------------------------------------------
+// 뉴스 · 공시
+// ---------------------------------------------------------------------------
+
+/** "202610151428" → "2026-10-15 14:28" */
+function formatCompactDateTime(value: unknown): string | null {
+  const digits = String(value ?? '').replace(/\D/g, '');
+  if (digits.length < 12) return value ? String(value) : null;
+  return `${digits.slice(0, 4)}-${digits.slice(4, 6)}-${digits.slice(6, 8)} ${digits.slice(8, 10)}:${digits.slice(10, 12)}`;
+}
+
+/** 뉴스 제목·요약의 &quot; 같은 HTML 엔티티 해제 */
+function decodeEntities(value: unknown): string {
+  return cheerio.load(`<p>${String(value ?? '')}</p>`)('p').text();
+}
+
+export async function getStockNews(code: string, limit = 10) {
+  const data = await getJson<any[]>(`${MOBILE_API}/news/stock/${code}?pageSize=${limit}`);
+  // 응답은 [{ total, items: [...] }] 형태의 묶음 배열 (관련 기사끼리 묶임)
+  const items = (Array.isArray(data) ? data : []).flatMap((group) =>
+    Array.isArray(group?.items) ? group.items : [],
+  );
+  return items.slice(0, limit).map((item: any) => ({
+    datetime: formatCompactDateTime(item.datetime),
+    press: item.officeName ?? null,
+    title: decodeEntities(item.titleFull ?? item.title),
+    summary: item.body ? decodeEntities(item.body).trim() : null,
+    url: item.mobileNewsUrl ?? null,
+  }));
+}
+
+export async function getDisclosures(code: string, limit = 10) {
+  const data = await getJson<any[]>(`${MOBILE_API}/stock/${code}/disclosure?pageSize=${limit}`);
+  return (Array.isArray(data) ? data : []).slice(0, limit).map((item) => ({
+    id: item.disclosureId,
+    datetime: item.datetime ? String(item.datetime).replace('T', ' ') : null,
+    title: item.title,
+    source: item.author ?? null,
+  }));
+}
+
+/** 공시 본문 (HTML 을 텍스트로 변환, maxLength 자까지) */
+export async function getDisclosureDetail(code: string, disclosureId: number, maxLength = 8000) {
+  const data = await getJson<any>(`${MOBILE_API}/stock/${code}/disclosure/${disclosureId}`);
+  const disclosure = data?.disclosure;
+  if (!disclosure) throw new NaverApiError(`공시(${disclosureId})를 찾지 못했습니다.`);
+  const $ = cheerio.load(String(disclosure.contents ?? ''));
+  $('script, style, .noprint').remove();
+  const clean = (value: string) => value.replace(/\s+/g, ' ').trim();
+  // 표는 행 단위로 "셀 | 셀 | 셀" 한 줄로 만든다 (안쪽 표부터 처리)
+  $('table')
+    .toArray()
+    .reverse()
+    .forEach((table) => {
+      const lines = $(table)
+        .find('tr')
+        .toArray()
+        .map((row) =>
+          $(row)
+            .children('td, th')
+            .toArray()
+            .map((cell) => clean($(cell).text()))
+            .join(' | '),
+        )
+        .filter((line) => line.replace(/[\s|-]/g, ''));
+      $(table).replaceWith(`\n${lines.join('\n')}\n`);
+    });
+  $('br').replaceWith('\n');
+  $('p, div').append('\n');
+  const text = $.root()
+    .text()
+    .split('\n')
+    .map((line) => line.replace(/[ \t ]+/g, ' ').trim())
+    .filter(Boolean)
+    .join('\n');
+  return {
+    id: disclosure.disclosureId,
+    datetime: disclosure.datetime ? String(disclosure.datetime).replace('T', ' ') : null,
+    truncated: text.length > maxLength,
+    text: text.slice(0, maxLength),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// 현재가 스냅샷 · 호가
+// ---------------------------------------------------------------------------
+
+/** integration/basic 의 totalInfos 배열을 { 전일: ..., 시가: ... } 로 변환 (숫자로 바꿀 수 있으면 숫자) */
+function mapTotalInfos(infos: any[] | undefined) {
+  const result: Record<string, number | string | null> = {};
+  for (const info of infos || []) {
+    if (!info?.key) continue;
+    const raw = info.value;
+    // "1,210조 1,797억", "2026.08.13." 처럼 단위가 섞였거나 날짜인 값은 문자열 그대로 둔다
+    const isPlain = typeof raw === 'string' && /^[+-]?\d[\d,]*(\.\d+)?(%|배|원)?$/.test(raw.trim());
+    result[info.key] = isPlain ? toNumber(raw) : raw ?? null;
+  }
+  return result;
+}
+
+export async function getStockQuote(code: string) {
+  const [basic, integration] = await Promise.all([getStockBasic(code), getStockIntegration(code)]);
+  return {
+    code,
+    name: basic?.stockName ?? integration?.stockName ?? null,
+    market: basic?.stockExchangeName ?? null,
+    price: toNumber(basic?.closePrice),
+    change: toNumber(basic?.compareToPreviousClosePrice),
+    changeRate: toNumber(basic?.fluctuationsRatio),
+    marketStatus: basic?.marketStatus ?? null,
+    tradedAt: basic?.localTradedAt ?? null,
+    details: mapTotalInfos(integration?.totalInfos),
+  };
+}
+
+export async function getOrderBook(code: string) {
+  const data = await getJson<any>(`${MOBILE_API}/stock/${code}/askingPrice`);
+  const mapLevels = (levels: any[] | undefined) =>
+    (levels || []).map((level) => ({ price: toNumber(level.price), quantity: toNumber(level.count) }));
+  return {
+    previousClose: toNumber(data?.lastClosePrice),
+    // 매도호가는 높은 가격부터, 매수호가는 높은 가격부터 정렬되어 온다
+    asks: mapLevels(data?.sellInfo),
+    bids: mapLevels(data?.buyInfos),
+    totalAskQuantity: toNumber(data?.totalSell),
+    totalBidQuantity: toNumber(data?.totalBuy),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// ETF
+// ---------------------------------------------------------------------------
+
+export async function getEtfAnalysis(code: string) {
+  const data = await getJson<any>(`${MOBILE_API}/stock/${code}/etfAnalysis`);
+  if (!data?.itemCode) {
+    throw new NaverApiError(`${code} 는 ETF 분석 정보가 없습니다. (ETF 종목코드인지 확인하세요)`);
+  }
+  const returns = data.themeReturns ?? {};
+  const inflowRaw = data.cumulativeNetInflowList;
+  const inflow = (Array.isArray(inflowRaw) ? inflowRaw[0] : inflowRaw) ?? {};
+  return {
+    code: data.itemCode,
+    name: data.itemName,
+    summary: data.etfSummary ?? null,
+    issuer: data.issuerName ?? null,
+    baseIndex: data.etfBaseIndex ?? null,
+    listedDate: data.listedDate ?? null,
+    marketCap: data.marketValue ?? null,
+    totalNav: data.totalNav ?? null,
+    nav: toNumber(data.nav),
+    deviationRatePct: data.deviationRate === undefined ? null : toNumber(`${data.deviationSign ?? ''}${data.deviationRate}`),
+    totalFeePct: toNumber(data.totalFee),
+    trackingErrorPct: toNumber(data.chaseErrorRate),
+    returnsPct: {
+      '1일': toNumber(returns.returnRate1d),
+      '1주': toNumber(returns.returnRate1w),
+      '1개월': toNumber(returns.returnRate1m),
+      '3개월': toNumber(returns.returnRate3m),
+      '6개월': toNumber(returns.returnRate6m),
+      YTD: toNumber(returns.returnRateYtd),
+      '1년': toNumber(returns.returnRate1y),
+      '3년': toNumber(returns.returnRate3y),
+      '5년': toNumber(returns.returnRate5y),
+    },
+    netInflow: inflow.referenceDate
+      ? {
+          referenceDate: inflow.referenceDate,
+          '1일': inflow.cumulativeNetInflow1d ?? null,
+          '1주': inflow.cumulativeNetInflow1w ?? null,
+          '1개월': inflow.cumulativeNetInflow1m ?? null,
+          '3개월': inflow.cumulativeNetInflow3m ?? null,
+          YTD: inflow.cumulativeNetInflowYtd ?? null,
+          '1년': inflow.cumulativeNetInflow1y ?? null,
+        }
+      : null,
+    dividend: data.dividend
+      ? {
+          yieldTtmPct: toNumber(data.dividend.dividendYieldTtm),
+          perShareTtm: toNumber(data.dividend.dividendPerShareTtm),
+          countThisYear: data.dividend.dividendCountThisYear ?? null,
+          monthsThisYear: data.dividend.dividendMonthThisYear ?? null,
+        }
+      : null,
+    topHoldings: (data.etfTop10MajorConstituentAssets || []).map((item: any) => ({
+      rank: item.seq,
+      code: item.itemCode ?? null,
+      name: item.itemName,
+      shares: toNumber(item.stockCount),
+      weightPct: toNumber(item.etfWeight),
+    })),
+    assetAllocation: (data.assetPortfolioList || []).map((item: any) => ({
+      type: item.detailTypeCode,
+      weightPct: toNumber(item.weight),
+    })),
+    sectorAllocation: (data.sectorPortfolioList || [])
+      .map((item: any) => ({ sector: item.detailTypeCode, weightPct: toNumber(item.weight) }))
+      .filter((item: { weightPct: number | null }) => item.weightPct),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// 해외주식 · 해외지수 · 환율/원자재/금리
+// ---------------------------------------------------------------------------
+
+const WORLD_API = 'https://api.stock.naver.com';
+
+/** 해외 종목명/티커/로이터코드(AAPL.O) → 로이터코드 */
+export async function resolveWorldStock(query: string): Promise<{ reutersCode: string; name: string | null }> {
+  const input = query.trim();
+  if (/^[A-Z0-9-]+\.[A-Z]+$/i.test(input)) return { reutersCode: input.toUpperCase(), name: null };
+  const data = await getJson<any>(
+    `https://ac.stock.naver.com/ac?q=${encodeURIComponent(input)}&target=stock`,
+    'https://stock.naver.com/',
+  );
+  const items: any[] = (Array.isArray(data?.items) ? data.items : []).filter(
+    (item: any) => item.nationCode !== 'KOR' && item.reutersCode,
+  );
+  const upper = input.toUpperCase();
+  const match =
+    items.find((item) => String(item.code).toUpperCase() === upper) ||
+    items.find((item) => item.name === input) ||
+    items[0];
+  if (!match) throw new NaverApiError(`'${input}'에 해당하는 해외 종목을 찾지 못했습니다.`);
+  return { reutersCode: match.reutersCode, name: match.name };
+}
+
+export async function getWorldStockQuote(reutersCode: string) {
+  const [basic, integration] = await Promise.all([
+    getJson<any>(`${WORLD_API}/stock/${encodeURIComponent(reutersCode)}/basic`),
+    getJson<any>(`${WORLD_API}/stock/${encodeURIComponent(reutersCode)}/integration`).catch(() => null),
+  ]);
+  const consensus = integration?.consensusInfo;
+  const price = toNumber(basic?.closePrice);
+  const targetMean = toNumber(consensus?.priceTargetMean);
+  return {
+    reutersCode,
+    ticker: basic?.symbolCode ?? null,
+    name: basic?.stockName ?? null,
+    nameEng: basic?.stockNameEng ?? null,
+    exchange: basic?.stockExchangeName ?? null,
+    currency: basic?.currencyType?.code ?? null,
+    price,
+    change: toNumber(basic?.compareToPreviousClosePrice),
+    changeRate: toNumber(basic?.fluctuationsRatio),
+    marketStatus: basic?.marketStatus ?? null,
+    tradedAt: basic?.localTradedAt ?? null,
+    details: mapTotalInfos(basic?.stockItemTotalInfos),
+    consensus: consensus
+      ? {
+          date: consensus.createDate,
+          targetPriceMean: targetMean,
+          targetPriceHigh: toNumber(consensus.priceTargetHigh),
+          targetPriceLow: toNumber(consensus.priceTargetLow),
+          upsidePct: price && targetMean ? Math.round(((targetMean - price) / price) * 10000) / 100 : null,
+          recommendationMean: toNumber(consensus.recommMean),
+          recommendationScale: '1 매도 · 2 비중축소 · 3 중립 · 4 매수 · 5 적극매수',
+        }
+      : null,
+    companySummary: integration?.summaries?.summary ?? integration?.summaries?.[0]?.summary ?? null,
+  };
+}
+
+export async function getWorldIndex(reutersCode: string) {
+  const data = await getJson<any>(`${WORLD_API}/index/${encodeURIComponent(reutersCode)}/basic`);
+  return {
+    code: reutersCode,
+    name: data?.indexName ?? reutersCode,
+    close: toNumber(data?.closePrice),
+    change: toNumber(data?.compareToPreviousClosePrice),
+    changeRate: toNumber(data?.fluctuationsRatio),
+    tradedAt: data?.localTradedAt ?? null,
+  };
+}
+
+export type MarketIndexCategory = 'exchange' | 'energy' | 'metals' | 'bond';
+
+export async function getMarketIndexItem(category: MarketIndexCategory, reutersCode: string) {
+  const data = await getJson<any>(
+    `https://m.stock.naver.com/front-api/marketIndex/productDetail?category=${category}&reutersCode=${encodeURIComponent(reutersCode)}`,
+  );
+  const item = data?.result;
+  if (!data?.isSuccess || !item) throw new NaverApiError(`${reutersCode} 시세를 불러오지 못했습니다.`);
+  return {
+    code: reutersCode,
+    name: item.name,
+    price: toNumber(item.closePrice),
+    change: toNumber(item.fluctuations),
+    changeRate: toNumber(item.fluctuationsRatio),
+    unit: item.unit ?? (category === 'bond' ? '%' : null),
+    tradedAt: item.localTradedAt ?? null,
+  };
+}
+
+export const WORLD_INDEX_CODES = ['.DJI', '.IXIC', '.INX', '.SOX', '.N225', '.SSEC', '.HSI'];
+
+export const MARKET_INDEX_ITEMS: Record<MarketIndexCategory, string[]> = {
+  exchange: ['FX_USDKRW', 'FX_JPYKRW', 'FX_EURKRW', 'FX_CNYKRW'],
+  energy: ['CLcv1', 'LCOcv1'],
+  metals: ['GCcv1', 'SIcv1', 'HGcv1'],
+  bond: ['US10YT=RR', 'KR3YT=RR', 'KR10YT=RR'],
+};
+
 export { INDEX_CODES };

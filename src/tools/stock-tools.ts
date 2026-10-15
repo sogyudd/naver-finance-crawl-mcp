@@ -20,6 +20,19 @@ import {
   resolveStockCode,
   searchStocks,
   toNumber,
+  getStockNews,
+  getDisclosures,
+  getDisclosureDetail,
+  getStockQuote,
+  getOrderBook,
+  getEtfAnalysis,
+  resolveWorldStock,
+  getWorldStockQuote,
+  getWorldIndex,
+  getMarketIndexItem,
+  WORLD_INDEX_CODES,
+  MARKET_INDEX_ITEMS,
+  MarketIndexCategory,
 } from '../crawlers/naverStockApi.js';
 
 type ToolResult = { content: { type: 'text'; text: string }[]; isError?: boolean };
@@ -444,6 +457,128 @@ const marketOverviewTool = {
   ),
 };
 
+const newsTool = {
+  name: 'get_stock_news',
+  title: 'Get Stock News',
+  description: '종목 관련 최신 뉴스(일시, 언론사, 제목, 요약, 기사 링크)를 조회합니다.',
+  inputSchema: z.object({
+    stock: stockParam,
+    limit: z.number().int().min(1).max(50).optional().describe('가져올 기사 수 (기본 10)'),
+  }),
+  handler: wrap(async ({ stock, limit }: { stock: string; limit?: number }) => {
+    const target = await resolveStockCode(stock);
+    const news = await getStockNews(target.code, limit ?? 10);
+    return { code: target.code, name: target.name, count: news.length, news };
+  }),
+};
+
+const disclosuresTool = {
+  name: 'get_disclosures',
+  title: 'Get Disclosures',
+  description:
+    '종목의 최근 공시 목록(공시ID, 일시, 제목)을 조회합니다. disclosureId 를 주면 해당 공시 본문을 텍스트로 돌려줍니다.',
+  inputSchema: z.object({
+    stock: stockParam,
+    limit: z.number().int().min(1).max(50).optional().describe('목록 개수 (기본 10)'),
+    disclosureId: z.number().int().optional().describe('본문을 볼 공시ID (목록의 id 값)'),
+  }),
+  handler: wrap(
+    async ({ stock, limit, disclosureId }: { stock: string; limit?: number; disclosureId?: number }) => {
+      const target = await resolveStockCode(stock);
+      if (disclosureId !== undefined) {
+        const detail = await getDisclosureDetail(target.code, disclosureId);
+        return { code: target.code, name: target.name, disclosure: detail };
+      }
+      const disclosures = await getDisclosures(target.code, limit ?? 10);
+      return { code: target.code, name: target.name, count: disclosures.length, disclosures };
+    },
+  ),
+};
+
+const quoteTool = {
+  name: 'get_stock_quote',
+  title: 'Get Stock Quote',
+  description:
+    '국내 종목의 현재가 스냅샷(현재가, 등락, 시가·고가·저가, 거래량·대금, 시가총액, 52주 최고·최저, PER·EPS·추정PER·PBR·BPS, 배당수익률, 외국인소진율)과 5단계 매도·매수 호가를 조회합니다.',
+  inputSchema: z.object({
+    stock: stockParam,
+    includeOrderBook: z.boolean().optional().describe('호가 포함 여부 (기본 true)'),
+  }),
+  handler: wrap(async ({ stock, includeOrderBook }: { stock: string; includeOrderBook?: boolean }) => {
+    const target = await resolveStockCode(stock);
+    const [quote, orderBook] = await Promise.all([
+      getStockQuote(target.code),
+      includeOrderBook === false ? null : getOrderBook(target.code).catch(() => null),
+    ]);
+    return { ...quote, unit: '원, 주', orderBook };
+  }),
+};
+
+const etfTool = {
+  name: 'get_etf_analysis',
+  title: 'Get ETF Analysis',
+  description:
+    '국내 ETF 분석: 기초지수, 운용사, NAV, 괴리율, 총보수, 추적오차, 기간별 수익률, 자금 순유입, 분배금, 상위 10개 구성종목과 비중, 자산·섹터 구성을 조회합니다.',
+  inputSchema: z.object({
+    stock: z.string().min(1).describe('ETF 이름 또는 6자리 코드 (예: "KODEX 200", "069500")'),
+  }),
+  handler: wrap(async ({ stock }: { stock: string }) => {
+    const target = await resolveStockCode(stock);
+    return getEtfAnalysis(target.code);
+  }),
+};
+
+const worldStockTool = {
+  name: 'get_world_stock',
+  title: 'Get World Stock',
+  description:
+    '해외 주식(미국·일본·중국 등) 시세와 지표(시가·고가·저가, 거래량, 시가총액, 52주 최고·최저, PER·EPS·PBR, 배당), 애널리스트 컨센서스(목표주가 평균·최고·최저, 투자의견), 기업 개요를 조회합니다. 금액은 해당 통화 기준.',
+  inputSchema: z.object({
+    stock: z
+      .string()
+      .min(1)
+      .describe('해외 종목명, 티커 또는 로이터코드 (예: "애플", "NVDA", "AAPL.O")'),
+  }),
+  handler: wrap(async ({ stock }: { stock: string }) => {
+    const target = await resolveWorldStock(stock);
+    return getWorldStockQuote(target.reutersCode);
+  }),
+};
+
+const globalMarketsTool = {
+  name: 'get_global_markets',
+  title: 'Get Global Markets',
+  description:
+    '해외 주요 지수(다우, 나스닥, S&P500, 필라델피아 반도체, 니케이, 상해, 항셍), 환율(USD·JPY(100엔)·EUR·CNY/원), 원자재(WTI, 브렌트유, 금, 은, 구리), 금리(미국 10년, 한국 3년·10년 국채)를 한 번에 조회합니다.',
+  inputSchema: z.object({
+    categories: z
+      .array(z.enum(['indices', 'exchange', 'energy', 'metals', 'bond']))
+      .optional()
+      .describe('조회할 분류 (기본 전체): indices(해외지수), exchange(환율), energy(유가), metals(금속), bond(금리)'),
+  }),
+  handler: wrap(
+    async ({ categories }: { categories?: ('indices' | 'exchange' | 'energy' | 'metals' | 'bond')[] }) => {
+      const selected = categories && categories.length ? categories : ['indices', 'exchange', 'energy', 'metals', 'bond'];
+      const result: Record<string, unknown[]> = {};
+      await Promise.all(
+        selected.map(async (category) => {
+          if (category === 'indices') {
+            result.indices = await Promise.all(
+              WORLD_INDEX_CODES.map((code) => getWorldIndex(code).catch(() => ({ code, error: true }))),
+            );
+            return;
+          }
+          const key = category as MarketIndexCategory;
+          result[key] = await Promise.all(
+            MARKET_INDEX_ITEMS[key].map((code) => getMarketIndexItem(key, code).catch(() => ({ code, error: true }))),
+          );
+        }),
+      );
+      return result;
+    },
+  ),
+};
+
 export const stockTools = [
   searchStockTool,
   priceHistoryTool,
@@ -455,4 +590,10 @@ export const stockTools = [
   sectorOverviewTool,
   shareholdersTool,
   marketOverviewTool,
+  newsTool,
+  disclosuresTool,
+  quoteTool,
+  etfTool,
+  worldStockTool,
+  globalMarketsTool,
 ];
