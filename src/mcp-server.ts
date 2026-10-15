@@ -7,6 +7,7 @@ import { createServer } from 'http';
 import { Command } from 'commander';
 import { crawlTopStocksTool } from './tools/crawl-top-stocks.js';
 import { crawlStockDetailTool } from './tools/crawl-stock-detail.js';
+import { stockTools } from './tools/stock-tools.js';
 
 /** Default HTTP server port */
 const DEFAULT_PORT = 5000;
@@ -79,6 +80,21 @@ function createServerInstance() {
     },
     crawlStockDetailTool.handler
   );
+
+  // Register Naver stock data tools
+  for (const tool of stockTools) {
+    server.registerTool(
+      tool.name,
+      {
+        title: tool.title,
+        description: tool.description,
+        // 도구마다 스키마가 달라 타입 추론이 과도하게 깊어지지 않도록 any 로 전달
+        inputSchema: tool.inputSchema.shape as any,
+        outputSchema: undefined,
+      },
+      tool.handler as any
+    );
+  }
 
   return server;
 }
